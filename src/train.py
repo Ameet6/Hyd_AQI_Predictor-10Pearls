@@ -4,8 +4,7 @@ Pearls AQI Predictor — Training Pipeline
 Loads feature data from MongoDB, builds a 72-hour-ahead AQI target,
 does a time-based train/test split, trains multiple models, evaluates
 with RMSE/MAE/R2, and saves the best model to the model registry:
-  - the trained model file -> models/ (local folder, gitignored)
-  - metadata about the run  -> MongoDB "models" collection
+  - the model binary and metadata -> MongoDB "models" collection
 
 Run manually for now:
     python -m src.train
@@ -13,9 +12,9 @@ Run manually for now:
 Later, GitHub Actions runs this daily.
 """
 
+import io
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
 
 import joblib
 import numpy as np
@@ -23,6 +22,7 @@ import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from bson.binary import Binary
 from pymongo.errors import PyMongoError
 
 from src import config, db
@@ -35,8 +35,6 @@ FEATURE_COLS = [
     "temperature", "humidity", "pressure", "wind_speed",
     "hour", "day", "month", "day_of_week", "aqi_change_rate",
 ]
-
-MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 
 
 def load_data(collection) -> pd.DataFrame:
@@ -97,15 +95,17 @@ def select_best(results: list) -> dict:
 
 
 def save_model_registry(best: dict, models_collection):
-    """Save the model file locally, and its metadata to MongoDB."""
-    MODELS_DIR.mkdir(exist_ok=True)
+    """
+    Serialize the model to bytes in memory (no local file), and store both
+    the model bytes and its metadata as one MongoDB document. This means
+    the model is reachable from anywhere — your laptop, GitHub Actions,
+    or the dashboard — since it lives in the database, not on disk.
+    """
+    buffer = io.BytesIO()
+    joblib.dump(best["model"], buffer)
+    model_bytes = buffer.getvalue()
 
     trained_at = datetime.now(timezone.utc)
-    version_str = trained_at.strftime("%Y%m%d_%H%M%S")
-    filename = f"{best['name']}_{version_str}.pkl"
-    filepath = MODELS_DIR / filename
-
-    joblib.dump(best["model"], filepath)
 
     metadata = {
         "city": config.CITY_NAME,
@@ -114,7 +114,7 @@ def save_model_registry(best: dict, models_collection):
         "horizon_hours": HORIZON_HOURS,
         "feature_cols": FEATURE_COLS,
         "metrics": best["metrics"],
-        "file_path": str(filepath),
+        "model_binary": Binary(model_bytes),
         "is_active": True,  # this is now the "current" model to use for predictions
     }
 
@@ -127,11 +127,13 @@ def save_model_registry(best: dict, models_collection):
     )
     models_collection.insert_one(metadata)
 
-    print(f"Saved model: {filepath}")
+    size_kb = len(model_bytes) / 1024
+    print(f"Model serialized: {size_kb:.1f} KB")
     print(f"Registered in MongoDB 'models' collection as active model for {config.CITY_NAME}")
 
 
 def run():
+    print("Starting training pipeline...")
     config.validate()
     client = db.get_client()
     try:
