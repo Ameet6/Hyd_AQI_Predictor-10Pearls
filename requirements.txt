@@ -1,0 +1,10 @@
+requests
+pymongo
+python-dotenv
+pandas
+matplotlib
+seaborn
+jupyter
+ipykernel
+scikit-learn
+joblib
