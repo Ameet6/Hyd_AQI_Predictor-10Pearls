@@ -1,10 +1,13 @@
 """
-Pearls AQI Predictor — Training Pipeline
--------------------------------------------
-Loads feature data from MongoDB, builds a 72-hour-ahead AQI target,
-does a time-based train/test split, trains multiple models, evaluates
-with RMSE/MAE/R2, and saves the best model to the model registry:
-  - the model binary and metadata -> MongoDB "models" collection
+Pearls AQI Predictor — Training Pipeline (multi-horizon)
+------------------------------------------------------------
+For each forecast horizon (24h, 48h, 72h = Day 1/2/3), this:
+  1. Builds a target column shifted by that many hours
+  2. Does a time-based train/test split
+  3. Trains multiple candidate models, evaluates with RMSE/MAE/R2
+  4. Saves the best model (as binary) + metadata to the MongoDB model registry,
+     tagged with its horizon, so the dashboard can fetch "the Day 2 model"
+     separately from "the Day 1 model".
 
 Run manually for now:
     python -m src.train
@@ -27,8 +30,9 @@ from pymongo.errors import PyMongoError
 
 from src import config, db
 
-HORIZON_HOURS = 72          # how far ahead we're forecasting (3 days)
-TRAIN_SPLIT_RATIO = 0.85    # fraction of the timeline used for training
+# One model per horizon — Day 1, Day 2, Day 3
+HORIZONS_HOURS = [24, 48, 72]
+TRAIN_SPLIT_RATIO = 0.85
 
 FEATURE_COLS = [
     "aqi", "pm2_5", "pm10", "co", "no2", "so2", "o3",
@@ -46,15 +50,17 @@ def load_data(collection) -> pd.DataFrame:
     return df
 
 
-def build_target_and_split(df: pd.DataFrame):
-    """Shift AQI forward by HORIZON_HOURS to create the target, then split
-    chronologically (train = earlier data, test = later/unseen data)."""
-    df["aqi_target"] = df["aqi"].shift(-HORIZON_HOURS)
-    df = df.dropna(subset=["aqi_target"]).reset_index(drop=True)
+def build_target_and_split(df: pd.DataFrame, horizon_hours: int):
+    """Shift AQI forward by horizon_hours to create the target for THIS
+    horizon, then split chronologically. Uses a copy so each horizon's
+    target column doesn't interfere with the others."""
+    horizon_df = df.copy()
+    horizon_df["aqi_target"] = horizon_df["aqi"].shift(-horizon_hours)
+    horizon_df = horizon_df.dropna(subset=["aqi_target"]).reset_index(drop=True)
 
-    split_index = int(len(df) * TRAIN_SPLIT_RATIO)
-    train_df = df.iloc[:split_index]
-    test_df = df.iloc[split_index:]
+    split_index = int(len(horizon_df) * TRAIN_SPLIT_RATIO)
+    train_df = horizon_df.iloc[:split_index]
+    test_df = horizon_df.iloc[split_index:]
     return train_df, test_df
 
 
@@ -83,24 +89,18 @@ def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame):
             "mae": float(mean_absolute_error(y_test, preds)),
             "r2": float(r2_score(y_test, preds)),
         }
-        print(f"{name}: RMSE={metrics['rmse']:.2f}, MAE={metrics['mae']:.2f}, R2={metrics['r2']:.3f}")
         results.append({"name": name, "model": model, "metrics": metrics})
 
     return results
 
 
 def select_best(results: list) -> dict:
-    """Pick the model with the highest R2 (higher = explains more variance = better)."""
     return max(results, key=lambda r: r["metrics"]["r2"])
 
 
-def save_model_registry(best: dict, models_collection):
-    """
-    Serialize the model to bytes in memory (no local file), and store both
-    the model bytes and its metadata as one MongoDB document. This means
-    the model is reachable from anywhere — your laptop, GitHub Actions,
-    or the dashboard — since it lives in the database, not on disk.
-    """
+def save_model_registry(best: dict, horizon_hours: int, models_collection):
+    """Serialize the model to bytes and store it + metadata in MongoDB,
+    tagged with its horizon so it can be fetched independently later."""
     buffer = io.BytesIO()
     joblib.dump(best["model"], buffer)
     model_bytes = buffer.getvalue()
@@ -111,29 +111,28 @@ def save_model_registry(best: dict, models_collection):
         "city": config.CITY_NAME,
         "algorithm": best["name"],
         "trained_at": trained_at,
-        "horizon_hours": HORIZON_HOURS,
+        "horizon_hours": horizon_hours,
         "feature_cols": FEATURE_COLS,
         "metrics": best["metrics"],
         "model_binary": Binary(model_bytes),
-        "is_active": True,  # this is now the "current" model to use for predictions
+        "is_active": True,
     }
 
-    # Deactivate any previously active model for this city, so there's
-    # only ever one "is_active: True" model at a time — the dashboard
-    # will always query for that one.
+    # Deactivate the previous active model for THIS city + THIS horizon only
+    # (leaves the other horizons' active models untouched).
     models_collection.update_many(
-        {"city": config.CITY_NAME, "is_active": True},
+        {"city": config.CITY_NAME, "horizon_hours": horizon_hours, "is_active": True},
         {"$set": {"is_active": False}},
     )
     models_collection.insert_one(metadata)
 
     size_kb = len(model_bytes) / 1024
-    print(f"Model serialized: {size_kb:.1f} KB")
-    print(f"Registered in MongoDB 'models' collection as active model for {config.CITY_NAME}")
+    print(f"  Best: {best['name']} (R2={best['metrics']['r2']:.3f}), "
+          f"serialized {size_kb:.1f} KB, saved as active {horizon_hours}h model")
 
 
 def run():
-    print("Starting training pipeline...")
+    print("Starting multi-horizon training pipeline...")
     config.validate()
     client = db.get_client()
     try:
@@ -141,16 +140,23 @@ def run():
         models_collection = db.get_collection(config.MODELS_COLLECTION, client)
 
         df = load_data(features_collection)
-        print(f"Loaded {len(df)} rows")
+        print(f"Loaded {len(df)} rows\n")
 
-        train_df, test_df = build_target_and_split(df)
-        print(f"Train: {len(train_df)} rows, Test: {len(test_df)} rows")
+        for horizon_hours in HORIZONS_HOURS:
+            print(f"--- Horizon: {horizon_hours}h (Day {horizon_hours // 24}) ---")
+            train_df, test_df = build_target_and_split(df, horizon_hours)
+            print(f"  Train: {len(train_df)} rows, Test: {len(test_df)} rows")
 
-        results = train_and_evaluate(train_df, test_df)
-        best = select_best(results)
-        print(f"\nBest model: {best['name']} (R2={best['metrics']['r2']:.3f})")
+            results = train_and_evaluate(train_df, test_df)
+            for r in results:
+                m = r["metrics"]
+                print(f"  {r['name']}: RMSE={m['rmse']:.2f}, MAE={m['mae']:.2f}, R2={m['r2']:.3f}")
 
-        save_model_registry(best, models_collection)
+            best = select_best(results)
+            save_model_registry(best, horizon_hours, models_collection)
+            print()
+
+        print("Multi-horizon training complete.")
 
     except PyMongoError as e:
         print(f"MongoDB error: {e}", file=sys.stderr)
