@@ -8,3 +8,6 @@ jupyter
 ipykernel
 scikit-learn
 joblib
+streamlit
+shap
+plotly
